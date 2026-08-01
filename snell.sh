@@ -300,9 +300,54 @@ is_snell_protected_by_shadow_tls() {
     [ "$backend_type" = "snell" ] && [ "$backend_port" = "$port" ]
 }
 
+set_shadow_tls_meta_value() {
+    local key="$1"
+    local value="$2"
+    [ -f "$SHADOW_TLS_META_FILE" ] || return 1
+    if grep -q "^${key}=" "$SHADOW_TLS_META_FILE"; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$SHADOW_TLS_META_FILE"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$SHADOW_TLS_META_FILE"
+    fi
+}
+
+ensure_shadow_tls_restore_metadata() {
+    local version="$1"
+    local port="$2"
+    local current_listen="$3"
+    local major original_listen loopback_listen
+
+    is_snell_protected_by_shadow_tls "$port" || return 0
+    original_listen=$(get_shadow_tls_meta_value SNELL_ORIGINAL_LISTEN 2>/dev/null)
+    [ -n "$original_listen" ] && return 0
+
+    case "$version" in
+        v6*)
+            major="6"
+            loopback_listen="127.0.0.1:$port,[::1]:$port"
+            ;;
+        v5*)
+            major="5"
+            loopback_listen="127.0.0.1:$port"
+            ;;
+        *) return 1 ;;
+    esac
+
+    if [ -z "$current_listen" ] || [ "$current_listen" = "$loopback_listen" ]; then
+        if [ "$major" = "6" ]; then
+            original_listen="0.0.0.0:$port,[::]:$port"
+        else
+            original_listen="0.0.0.0:$port"
+        fi
+    else
+        original_listen="$current_listen"
+    fi
+    set_shadow_tls_meta_value SNELL_ORIGINAL_LISTEN "$original_listen"
+}
+
 sync_shadow_tls_snell_version() {
     local version="$1"
-    local major backend_type original_listen
+    local major backend_type backend_port original_listen current_listen
     case "$version" in
         v6*) major="6" ;;
         v5*) major="5" ;;
@@ -311,18 +356,17 @@ sync_shadow_tls_snell_version() {
 
     backend_type=$(get_shadow_tls_meta_value BACKEND_TYPE 2>/dev/null)
     [ "$backend_type" = "snell" ] || return 0
-    if grep -q '^SNELL_MAJOR_VERSION=' "$SHADOW_TLS_META_FILE"; then
-        sed -i "s/^SNELL_MAJOR_VERSION=.*/SNELL_MAJOR_VERSION=$major/" "$SHADOW_TLS_META_FILE"
-    else
-        printf 'SNELL_MAJOR_VERSION=%s\n' "$major" >> "$SHADOW_TLS_META_FILE"
-    fi
+    backend_port=$(get_shadow_tls_meta_value BACKEND_PORT 2>/dev/null)
+    current_listen=$(get_snell_config_value listen /etc/snell/snell-server.conf)
+    ensure_shadow_tls_restore_metadata "$version" "$backend_port" "$current_listen" || return 1
+    set_shadow_tls_meta_value SNELL_MAJOR_VERSION "$major" || return 1
 
     # v5 只使用单监听地址，避免从 v6 降级后卸载 Shadow-TLS 时恢复出双地址格式。
     if [ "$major" = "5" ]; then
         original_listen=$(get_shadow_tls_meta_value SNELL_ORIGINAL_LISTEN 2>/dev/null)
         original_listen=${original_listen%%,*}
         if [ -n "$original_listen" ]; then
-            sed -i "s|^SNELL_ORIGINAL_LISTEN=.*|SNELL_ORIGINAL_LISTEN=$original_listen|" "$SHADOW_TLS_META_FILE"
+            set_shadow_tls_meta_value SNELL_ORIGINAL_LISTEN "$original_listen" || return 1
         fi
     fi
 }
@@ -330,10 +374,12 @@ sync_shadow_tls_snell_version() {
 normalize_listen_config() {
     local config_file="$1"
     local version="$2"
-    local port listen_value
+    local port listen_value current_listen
 
     port=$(get_snell_port_from_config "$config_file") || return 1
     if is_snell_protected_by_shadow_tls "$port"; then
+        current_listen=$(get_snell_config_value listen "$config_file")
+        ensure_shadow_tls_restore_metadata "$version" "$port" "$current_listen" || return 1
         if [[ "$version" == v6* ]]; then
             listen_value="127.0.0.1:$port,[::1]:$port"
         else
@@ -804,7 +850,7 @@ install_snell() {
     RANDOM_PSK=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 32)  # 增加密码长度
     
     # 配置端口和密码: 直接回车 = 用默认值(已有配置则沿用原值,否则用随机)
-    local default_port default_psk listen_value protected_backend_port=""
+    local default_port default_psk listen_value protected_backend_port="" current_listen=""
     default_port="$RANDOM_PORT"
     default_psk="$RANDOM_PSK"
     if [ -f "$CONF_FILE" ]; then
@@ -822,6 +868,12 @@ install_snell() {
         protected_backend_port=$(get_shadow_tls_meta_value BACKEND_PORT 2>/dev/null)
         if [ "$RANDOM_PORT" != "$protected_backend_port" ]; then
             log_error "Shadow-TLS 正在保护 Snell 端口 $protected_backend_port，修改端口前请先卸载 Shadow-TLS"
+            restore_install_state "$binary_backup" "$backup_file" "$service_backup" "$CONF_FILE" "$SYSTEMD_SERVICE_FILE"
+            exit 1
+        fi
+        current_listen=$(get_snell_config_value listen "$CONF_FILE")
+        if ! ensure_shadow_tls_restore_metadata "$SNELL_VERSION" "$RANDOM_PORT" "$current_listen"; then
+            log_error "无法保存 Shadow-TLS 使用前的 Snell 监听地址"
             restore_install_state "$binary_backup" "$backup_file" "$service_backup" "$CONF_FILE" "$SYSTEMD_SERVICE_FILE"
             exit 1
         fi

@@ -151,6 +151,30 @@ get_snell_loopback_listen() {
     fi
 }
 
+get_snell_public_listen() {
+    local major="$1"
+    local port="$2"
+    if [ "$major" = "6" ]; then
+        printf '0.0.0.0:%s,[::]:%s\n' "$port" "$port"
+    else
+        printf '0.0.0.0:%s\n' "$port"
+    fi
+}
+
+infer_snell_original_listen() {
+    local major="$1"
+    local port="$2"
+    local current_listen="$3"
+    local loopback_listen
+
+    loopback_listen=$(get_snell_loopback_listen "$major" "$port")
+    if [ -z "$current_listen" ] || [ "$current_listen" = "$loopback_listen" ]; then
+        get_snell_public_listen "$major" "$port"
+    else
+        printf '%s\n' "$current_listen"
+    fi
+}
+
 restart_snell_service() {
     systemctl restart snell 2>/dev/null || return 1
     sleep 1
@@ -319,10 +343,12 @@ download_stls() {
 install_stls() {
     detect_backends
     local backend_type backend_port sel b
-    local old_stls_port old_backend_port old_backend_type old_snell_original_listen
+    local old_stls_port old_stls_password old_sni old_backend_port old_backend_type old_snell_original_listen
     local snell_major_version="" snell_previous_listen="" snell_original_listen=""
     local had_binary=0 had_service=0 had_meta=0 was_active=0 was_enabled=0
     old_stls_port=$(get_meta_value STLS_PORT 2>/dev/null)
+    old_stls_password=$(get_meta_value STLS_PASSWORD 2>/dev/null)
+    old_sni=$(get_meta_value SNI 2>/dev/null)
     old_backend_port=$(get_meta_value BACKEND_PORT 2>/dev/null)
     old_backend_type=$(get_meta_value BACKEND_TYPE 2>/dev/null)
     old_snell_original_listen=$(get_meta_value SNELL_ORIGINAL_LISTEN 2>/dev/null)
@@ -375,19 +401,19 @@ install_stls() {
         if [ "$old_backend_type" = "snell" ] && [ "$old_backend_port" = "$backend_port" ] && [ -n "$old_snell_original_listen" ]; then
             snell_original_listen="$old_snell_original_listen"
         else
-            snell_original_listen="$snell_previous_listen"
+            snell_original_listen=$(infer_snell_original_listen "$snell_major_version" "$backend_port" "$snell_previous_listen")
         fi
     fi
 
     local stls_port stls_password custom
-    stls_port=$(get_random_free_port)
-    read -p "$(echo -e "${CYAN}◆ 对外端口 ${GRAY}(回车用随机 ${GREEN}$stls_port${GRAY})${CYAN}: ${NC}")" custom
+    stls_port=${old_stls_port:-$(get_random_free_port)}
+    read -p "$(echo -e "${CYAN}◆ 对外端口 ${GRAY}(回车使用 ${GREEN}$stls_port${GRAY})${CYAN}: ${NC}")" custom
     [ -n "$custom" ] && stls_port=$custom
     is_valid_port "$stls_port" || { log_error "对外端口无效: ${stls_port:-空}"; return 1; }
     [ "$stls_port" != "$backend_port" ] || { log_error "对外端口不能与后端端口相同"; return 1; }
 
-    stls_password=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)
-    read -p "$(echo -e "${CYAN}◆ 密码 ${GRAY}(回车用随机 ${GREEN}$stls_password${GRAY})${CYAN}: ${NC}")" custom
+    stls_password=${old_stls_password:-$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)}
+    read -p "$(echo -e "${CYAN}◆ 密码 ${GRAY}(回车使用 ${GREEN}$stls_password${GRAY})${CYAN}: ${NC}")" custom
     [ -n "$custom" ] && stls_password=$custom
     if ! [[ "$stls_password" =~ ^[A-Za-z0-9._~-]{8,128}$ ]]; then
         log_error "密码仅支持 8-128 位字母、数字及 . _ ~ -"
@@ -396,9 +422,13 @@ install_stls() {
 
     # 选 SNI 握手域名(均支持 TLS 1.3)
     local options=("gateway.icloud.com" "s0.awsstatic.com" "www.microsoft.com" "publicassets.cdn-apple.com" "swscan.apple.com")
-    echo "请选择 TLS 握手域名 (默认 1):"
+    local default_sni_choice=1
+    for i in "${!options[@]}"; do
+        [ "${options[$i]}" = "$old_sni" ] && default_sni_choice=$((i+1))
+    done
+    echo "请选择 TLS 握手域名 (默认 $default_sni_choice):"
     for i in "${!options[@]}"; do echo "$((i+1)). ${options[$i]}"; done
-    read -p "输入选项 [默认 1]: " tc; tc=${tc:-1}
+    read -p "输入选项 [默认 $default_sni_choice]: " tc; tc=${tc:-$default_sni_choice}
     local sni="${options[0]}"
     if [[ "$tc" =~ ^[0-9]+$ ]] && [ "$tc" -ge 1 ] && [ "$tc" -le "${#options[@]}" ]; then
         sni="${options[$((tc-1))]}"
@@ -515,6 +545,9 @@ uninstall_stls() {
     backend_type=$(get_meta_value BACKEND_TYPE 2>/dev/null)
     snell_major_version=$(get_snell_major_version 2>/dev/null) || snell_major_version=$(get_meta_value SNELL_MAJOR_VERSION 2>/dev/null)
     snell_original_listen=$(get_meta_value SNELL_ORIGINAL_LISTEN 2>/dev/null)
+    if [ "$backend_type" = "snell" ] && [[ "$snell_major_version" =~ ^(5|6)$ ]] && [ -z "$snell_original_listen" ]; then
+        snell_original_listen=$(infer_snell_original_listen "$snell_major_version" "$backend_port" "$(get_snell_config_value listen "$SNELL_CONF")")
+    fi
 
     systemctl stop shadow-tls 2>/dev/null || true
     if [ "$backend_type" = "snell" ] && [[ "$snell_major_version" =~ ^(5|6)$ ]]; then
