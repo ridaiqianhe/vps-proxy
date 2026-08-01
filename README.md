@@ -11,7 +11,7 @@
 | `tuic.sh` | TUIC v5 | 基于官方 [EAimTY/tuic](https://github.com/EAimTY/tuic) 服务端,自签证书,输出 Surge/mihomo 配置 |
 | `trojan.sh` | Trojan | 基于 [trojan-go](https://github.com/p4gefau1t/trojan-go),默认 SNI icloud.com,自签证书 + 允许不安全 |
 | `reality.sh` | VLESS + Vision + Reality | 基于官方 [Xray-core](https://github.com/XTLS/Xray-core),自动生成 UUID/x25519/shortId,可选 VLESS Encryption 与 ML-DSA-65 后量子加固 |
-| `shadow-tls.sh` | Shadow-TLS v3 前置 | 为已安装的 SS 2022 或 Snell 加壳,自动识别后端,输出 Surge/mihomo 配置 |
+| `shadow-tls.sh` | Shadow-TLS v3 前置 | 为已安装的 SS 2022 或 Snell 加壳,自动识别 Snell v5/v6 并收敛后端监听,输出 Surge/mihomo 配置 |
 | `tcp-tune.sh` | TCP 调优 | 启用 BBR + fq,按带宽时延积(BDP)放大 socket 缓冲区,含内存保护,可回退 |
 
 ## 使用

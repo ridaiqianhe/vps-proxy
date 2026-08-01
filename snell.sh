@@ -11,6 +11,7 @@ LATEST_VERSION=""   # v5 稳定版(兼容选项)
 V6_VERSION=""       # v6 主版本，自动跟随 Beta/RC/正式版
 VERSION_CACHE_FILE="/etc/snell/version_cache"  # 放在 root 专属目录，避免 /tmp 下被其他用户预植入
 INSTALLED_VERSION_FILE="/etc/snell/installed_version"
+SHADOW_TLS_META_FILE="/etc/shadow-tls/meta.env"
 VERSION_CACHE_TIMEOUT=3600  # 1小时缓存
 VERSION_CACHE_SCHEMA=2
 TEMP_DIR="$(mktemp -d /tmp/snell_install.XXXXXX)"
@@ -263,13 +264,82 @@ get_snell_port_from_config() {
     validate_port "$port" && printf '%s\n' "$port"
 }
 
+get_snell_config_value() {
+    local key="$1"
+    local config_file="$2"
+
+    awk -v key="$key" '
+        /^[[:space:]]*#/ {next}
+        {
+            if (index($0, "=") == 0) next
+            name = $0
+            sub(/=.*/, "", name)
+            gsub(/[[:space:]]/, "", name)
+            if (name == key) {
+                value = substr($0, index($0, "=") + 1)
+                sub(/^[[:space:]]+/, "", value)
+                sub(/[[:space:]]+$/, "", value)
+                print value
+                exit
+            }
+        }
+    ' "$config_file" 2>/dev/null
+}
+
+get_shadow_tls_meta_value() {
+    local key="$1"
+    [ -f "$SHADOW_TLS_META_FILE" ] || return 1
+    awk -v key="$key" 'index($0, key "=") == 1 {print substr($0, length(key) + 2); exit}' "$SHADOW_TLS_META_FILE"
+}
+
+is_snell_protected_by_shadow_tls() {
+    local port="$1"
+    local backend_type backend_port
+    backend_type=$(get_shadow_tls_meta_value BACKEND_TYPE 2>/dev/null)
+    backend_port=$(get_shadow_tls_meta_value BACKEND_PORT 2>/dev/null)
+    [ "$backend_type" = "snell" ] && [ "$backend_port" = "$port" ]
+}
+
+sync_shadow_tls_snell_version() {
+    local version="$1"
+    local major backend_type original_listen
+    case "$version" in
+        v6*) major="6" ;;
+        v5*) major="5" ;;
+        *) return 1 ;;
+    esac
+
+    backend_type=$(get_shadow_tls_meta_value BACKEND_TYPE 2>/dev/null)
+    [ "$backend_type" = "snell" ] || return 0
+    if grep -q '^SNELL_MAJOR_VERSION=' "$SHADOW_TLS_META_FILE"; then
+        sed -i "s/^SNELL_MAJOR_VERSION=.*/SNELL_MAJOR_VERSION=$major/" "$SHADOW_TLS_META_FILE"
+    else
+        printf 'SNELL_MAJOR_VERSION=%s\n' "$major" >> "$SHADOW_TLS_META_FILE"
+    fi
+
+    # v5 只使用单监听地址，避免从 v6 降级后卸载 Shadow-TLS 时恢复出双地址格式。
+    if [ "$major" = "5" ]; then
+        original_listen=$(get_shadow_tls_meta_value SNELL_ORIGINAL_LISTEN 2>/dev/null)
+        original_listen=${original_listen%%,*}
+        if [ -n "$original_listen" ]; then
+            sed -i "s|^SNELL_ORIGINAL_LISTEN=.*|SNELL_ORIGINAL_LISTEN=$original_listen|" "$SHADOW_TLS_META_FILE"
+        fi
+    fi
+}
+
 normalize_listen_config() {
     local config_file="$1"
     local version="$2"
     local port listen_value
 
     port=$(get_snell_port_from_config "$config_file") || return 1
-    if [[ "$version" == v6* ]]; then
+    if is_snell_protected_by_shadow_tls "$port"; then
+        if [[ "$version" == v6* ]]; then
+            listen_value="127.0.0.1:$port,[::1]:$port"
+        else
+            listen_value="127.0.0.1:$port"
+        fi
+    elif [[ "$version" == v6* ]]; then
         listen_value="0.0.0.0:$port,[::]:$port"
     else
         listen_value="0.0.0.0:$port"
@@ -292,6 +362,13 @@ detect_service_identity() {
 
 is_snell_installed() {
     systemctl cat snell.service >/dev/null 2>&1
+}
+
+verify_snell_service() {
+    local port="$1"
+    sleep 1
+    systemctl is-active --quiet snell 2>/dev/null || return 1
+    ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .
 }
 
 # 版本信息缓存管理
@@ -564,17 +641,23 @@ choose_version() {
 # 统一的版本检测函数
 get_snell_version_from_binary() {
     local binary_path="$1"
-    local version=""
+    local version="" output flag
     
-    if [ -f "$binary_path" ]; then
-        # 尝试多种方式获取版本
-        version=$("$binary_path" --version 2>/dev/null | grep -o 'v[0-9]\+\.[0-9]\+\.[0-9]\+[a-z]*[0-9]*' | head -1)
-        if [ -z "$version" ]; then
-            version=$("$binary_path" -v 2>/dev/null | grep -o 'v[0-9]\+\.[0-9]\+\.[0-9]\+[a-z]*[0-9]*' | head -1)
+    [ -x "$binary_path" ] || return 1
+    for flag in --version -v; do
+        if command -v timeout >/dev/null 2>&1; then
+            output=$(timeout 2 "$binary_path" "$flag" </dev/null 2>&1)
+        else
+            output=$("$binary_path" "$flag" </dev/null 2>&1)
         fi
-    fi
-    
-    echo "$version"
+        version=$(printf '%s\n' "$output" | grep -oE 'v?(5|6)\.[0-9]+\.[0-9]+[[:alnum:]]*' | head -n 1)
+        if [ -n "$version" ]; then
+            [[ "$version" == v* ]] || version="v$version"
+            printf '%s\n' "$version"
+            return 0
+        fi
+    done
+    return 1
 }
 
 record_installed_version() {
@@ -583,7 +666,13 @@ record_installed_version() {
         log_error "拒绝记录无效的 Snell 版本: $version"
         return 1
     fi
-    mkdir -p "$(dirname "$INSTALLED_VERSION_FILE")" && printf '%s\n' "$version" > "$INSTALLED_VERSION_FILE"
+    if ! mkdir -p "$(dirname "$INSTALLED_VERSION_FILE")" || ! printf '%s\n' "$version" > "$INSTALLED_VERSION_FILE"; then
+        return 1
+    fi
+    if ! sync_shadow_tls_snell_version "$version"; then
+        log_warn "Snell 版本已记录，但无法同步 Shadow-TLS 元数据"
+    fi
+    return 0
 }
 
 get_recorded_snell_version() {
@@ -598,20 +687,28 @@ get_recorded_snell_version() {
 
 # 获取已安装 Snell 的大版本号，用于输出 Surge 配置行。
 get_installed_major_version() {
-    local ver
-    ver=$(get_snell_version_from_binary "/usr/local/bin/snell-server")
-    [ -n "$ver" ] || ver=$(get_recorded_snell_version 2>/dev/null)
+    local ver listen_value
+    ver=$(get_recorded_snell_version 2>/dev/null)
+    [ -n "$ver" ] || ver=$(get_snell_version_from_binary "/usr/local/bin/snell-server")
     case "$ver" in
         v6*) echo "6" ;;
         v5*) echo "5" ;;
-        *) log_error "无法识别已安装的 Snell 版本: ${ver:-无版本信息}"; return 1 ;;
+        *)
+            listen_value=$(get_snell_config_value listen /etc/snell/snell-server.conf)
+            if [[ "$listen_value" == *,* ]] && [[ "$listen_value" == *"[::"* ]]; then
+                echo "6"
+            else
+                log_error "无法识别已安装的 Snell 版本: ${ver:-无版本信息}"
+                return 1
+            fi
+            ;;
     esac
 }
 
 get_current_version() {
     if [ -f "/usr/local/bin/snell-server" ]; then
-        CURRENT_VERSION=$(get_snell_version_from_binary "/usr/local/bin/snell-server")
-        [ -n "$CURRENT_VERSION" ] || CURRENT_VERSION=$(get_recorded_snell_version 2>/dev/null)
+        CURRENT_VERSION=$(get_recorded_snell_version 2>/dev/null)
+        [ -n "$CURRENT_VERSION" ] || CURRENT_VERSION=$(get_snell_version_from_binary "/usr/local/bin/snell-server")
         if [ -z "$CURRENT_VERSION" ]; then
             # 如果无法获取版本，通过文件时间和配置推测
             if [ -f "/etc/snell/snell-server.conf" ]; then
@@ -707,12 +804,12 @@ install_snell() {
     RANDOM_PSK=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 32)  # 增加密码长度
     
     # 配置端口和密码: 直接回车 = 用默认值(已有配置则沿用原值,否则用随机)
-    local default_port default_psk listen_value
+    local default_port default_psk listen_value protected_backend_port=""
     default_port="$RANDOM_PORT"
     default_psk="$RANDOM_PSK"
     if [ -f "$CONF_FILE" ]; then
         EXISTING_PORT=$(get_snell_port_from_config "$CONF_FILE")
-        EXISTING_PSK=$(awk -F ' = ' '/psk/ {print $2}' "$CONF_FILE" 2>/dev/null)
+        EXISTING_PSK=$(get_snell_config_value psk "$CONF_FILE")
         [ -n "$EXISTING_PORT" ] && default_port=$EXISTING_PORT
         [ -n "$EXISTING_PSK" ] && default_psk=$EXISTING_PSK
         log_warn "检测到现有配置,回车即沿用原端口/密码"
@@ -720,6 +817,15 @@ install_snell() {
 
     RANDOM_PORT=$(get_port_input "◆ 端口" "$default_port")
     RANDOM_PSK=$(get_password_input "◆ PSK" "$default_psk")
+
+    if [ "$(get_shadow_tls_meta_value BACKEND_TYPE 2>/dev/null)" = "snell" ]; then
+        protected_backend_port=$(get_shadow_tls_meta_value BACKEND_PORT 2>/dev/null)
+        if [ "$RANDOM_PORT" != "$protected_backend_port" ]; then
+            log_error "Shadow-TLS 正在保护 Snell 端口 $protected_backend_port，修改端口前请先卸载 Shadow-TLS"
+            restore_install_state "$binary_backup" "$backup_file" "$service_backup" "$CONF_FILE" "$SYSTEMD_SERVICE_FILE"
+            exit 1
+        fi
+    fi
     
     show_progress 8 10 "创建配置文件..."
     if ! mkdir -p "$CONF_DIR"; then
@@ -728,7 +834,13 @@ install_snell() {
         exit 1
     fi
 
-    if [[ "$SNELL_VERSION" == v6* ]]; then
+    if [ "$RANDOM_PORT" = "$protected_backend_port" ]; then
+        if [[ "$SNELL_VERSION" == v6* ]]; then
+            listen_value="127.0.0.1:$RANDOM_PORT,[::1]:$RANDOM_PORT"
+        else
+            listen_value="127.0.0.1:$RANDOM_PORT"
+        fi
+    elif [[ "$SNELL_VERSION" == v6* ]]; then
         listen_value="0.0.0.0:$RANDOM_PORT,[::]:$RANDOM_PORT"
     else
         listen_value="0.0.0.0:$RANDOM_PORT"
@@ -787,7 +899,7 @@ EOF
     fi
     
     show_progress 10 10 "启动服务..."
-    if ! systemctl restart snell; then
+    if ! systemctl restart snell || ! verify_snell_service "$RANDOM_PORT"; then
         log_error "启动 Snell 服务失败"
         
         restore_install_state "$binary_backup" "$backup_file" "$service_backup" "$CONF_FILE" "$SYSTEMD_SERVICE_FILE"
@@ -823,7 +935,15 @@ EOF
     echo -e "${GREEN}✅ Snell $SNELL_VERSION 安装成功！${NC}"
     echo ""
     echo -e "${CYAN}==================== 配置信息 ====================${NC}"
-    echo -e "${BLUE}$flag $ip_country = snell, $HOST_IP, $RANDOM_PORT, psk = $RANDOM_PSK, version = $version_num, reuse = true, tfo = true${NC}"
+    if is_snell_protected_by_shadow_tls "$RANDOM_PORT"; then
+        local stls_port stls_password stls_sni
+        stls_port=$(get_shadow_tls_meta_value STLS_PORT)
+        stls_password=$(get_shadow_tls_meta_value STLS_PASSWORD)
+        stls_sni=$(get_shadow_tls_meta_value SNI)
+        echo -e "${BLUE}$flag $ip_country-snell-stls = snell, $HOST_IP, $stls_port, psk=$RANDOM_PSK, version=$version_num, shadow-tls-password=$stls_password, shadow-tls-sni=$stls_sni, shadow-tls-version=3${NC}"
+    else
+        echo -e "${BLUE}$flag $ip_country = snell, $HOST_IP, $RANDOM_PORT, psk=$RANDOM_PSK, version=$version_num, tfo=true${NC}"
+    fi
     echo -e "${CYAN}===============================================${NC}"
     
     # 更新当前版本信息
@@ -880,9 +1000,10 @@ update_snell() {
     
     if [ "$CURRENT_VERSION" = "$target_version" ]; then
         if [ -f /etc/snell/snell-server.conf ]; then
-            local same_version_backup
+            local same_version_backup same_version_port
             same_version_backup=$(backup_config /etc/snell/snell-server.conf) || return 1
-            if normalize_listen_config /etc/snell/snell-server.conf "$target_version" && systemctl restart snell; then
+            same_version_port=$(get_snell_port_from_config /etc/snell/snell-server.conf) || return 1
+            if normalize_listen_config /etc/snell/snell-server.conf "$target_version" && systemctl restart snell && verify_snell_service "$same_version_port"; then
                 log_info "当前已是 $target_version，配置格式已校正"
             else
                 restore_config "$same_version_backup" /etc/snell/snell-server.conf
@@ -892,6 +1013,9 @@ update_snell() {
             fi
         else
             log_warn "当前版本已是目标版本 $target_version"
+        fi
+        if ! record_installed_version "$target_version"; then
+            log_warn "配置已校正，但无法写入版本记录文件"
         fi
         return 0
     fi
@@ -973,7 +1097,15 @@ update_snell() {
     fi
 
     show_progress 8 8 "重新启动服务..."
-    if ! systemctl start snell; then
+    local updated_port
+    updated_port=$(get_snell_port_from_config /etc/snell/snell-server.conf) || {
+        log_error "无法读取更新后的 Snell 端口，恢复原版本"
+        cp "/usr/local/bin/snell-server.backup" "/usr/local/bin/snell-server"
+        [ -n "$update_config_backup" ] && restore_config "$update_config_backup" /etc/snell/snell-server.conf
+        systemctl start snell
+        return 1
+    }
+    if ! systemctl start snell || ! verify_snell_service "$updated_port"; then
         log_error "启动 Snell 服务失败，恢复原版本"
         cp "/usr/local/bin/snell-server.backup" "/usr/local/bin/snell-server"
         [ -n "$update_config_backup" ] && restore_config "$update_config_backup" /etc/snell/snell-server.conf
@@ -997,6 +1129,11 @@ update_snell() {
 
 uninstall_snell() {
     log_info "开始卸载 Snell 服务器"
+
+    if [ "$(get_shadow_tls_meta_value BACKEND_TYPE 2>/dev/null)" = "snell" ]; then
+        log_error "Snell 正被 Shadow-TLS 使用，请先通过 shadow-tls.sh 卸载 Shadow-TLS"
+        return 1
+    fi
     
     if is_snell_installed; then
         echo "确认要卸载 Snell 服务器吗？这将删除所有相关文件。"
@@ -1042,7 +1179,7 @@ show_install_status() {
             if [ -f "/etc/snell/snell-server.conf" ]; then
                 local snell_port psk
                 snell_port=$(get_snell_port_from_config /etc/snell/snell-server.conf)
-                psk=$(awk -F ' = ' '/psk/ {print $2}' /etc/snell/snell-server.conf 2>/dev/null)
+                psk=$(get_snell_config_value psk /etc/snell/snell-server.conf)
                 echo -e "${BLUE}  端口: $snell_port${NC}"
                 echo -e "${BLUE}  密码: $psk${NC}"
             fi
@@ -1081,12 +1218,25 @@ generate_config() {
         if [ -f "$conf_file" ]; then
             local snell_port psk version_num
             snell_port=$(get_snell_port_from_config "$conf_file")
-            psk=$(awk -F ' = ' '/psk/ {print $2}' "$conf_file" 2>/dev/null)
+            psk=$(get_snell_config_value psk "$conf_file")
             if ! version_num=$(get_installed_major_version); then
                 return 1
             fi
 
-            echo -e "${BLUE}$flag $ip_country = snell, $HOST_IP, $snell_port, psk = $psk, version = $version_num, reuse = true, tfo = true${NC}"
+            if is_snell_protected_by_shadow_tls "$snell_port"; then
+                local stls_port stls_password stls_sni
+                stls_port=$(get_shadow_tls_meta_value STLS_PORT)
+                stls_password=$(get_shadow_tls_meta_value STLS_PASSWORD)
+                stls_sni=$(get_shadow_tls_meta_value SNI)
+                if validate_port "$stls_port" && [ -n "$stls_password" ] && [ -n "$stls_sni" ]; then
+                    echo -e "${BLUE}$flag $ip_country-snell-stls = snell, $HOST_IP, $stls_port, psk=$psk, version=$version_num, shadow-tls-password=$stls_password, shadow-tls-sni=$stls_sni, shadow-tls-version=3${NC}"
+                else
+                    log_error "Shadow-TLS 元数据不完整，请运行 shadow-tls.sh 重新安装"
+                    return 1
+                fi
+            else
+                echo -e "${BLUE}$flag $ip_country = snell, $HOST_IP, $snell_port, psk=$psk, version=$version_num, tfo=true${NC}"
+            fi
         else
             log_error "Snell 配置文件不存在"
         fi
