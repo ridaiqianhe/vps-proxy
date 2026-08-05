@@ -7,11 +7,11 @@
 | `snell.sh` | Snell v6 (兼容 v5) | 安装/更新/卸载/查看 systemd 日志,v6 为默认选项,自动输出 Surge 配置行(Shadow-TLS 加壳见 `shadow-tls.sh`) |
 | `hysteria2.sh` | Hysteria2 | 官方脚本安装 + 自签证书,输出 Clash 配置 |
 | `ss-2022.sh` | Shadowsocks 2022 (ss-rust) | 支持无交互安装 |
-| `anytls.sh` | AnyTLS (sing-box) | 基于官方 [sing-box](https://github.com/SagerNet/sing-box) 的普通 TLS AnyTLS,输出 Surge/mihomo/sing-box 配置和标准导入链接,安装/卸载/看日志 |
+| `anytls.sh` | AnyTLS (sing-box) | 基于官方 [sing-box](https://github.com/SagerNet/sing-box) 的普通 TLS AnyTLS,安装/更新时自动跟随稳定版,输出 Surge/mihomo/sing-box 配置和标准导入链接 |
 | `tuic.sh` | TUIC v5 | 基于官方 [EAimTY/tuic](https://github.com/EAimTY/tuic) 服务端,自签证书,输出 Surge/mihomo 配置 |
 | `trojan.sh` | Trojan | 基于 [trojan-go](https://github.com/p4gefau1t/trojan-go),默认 SNI icloud.com,自签证书 + 允许不安全 |
 | `reality.sh` | VLESS + Vision + Reality | 基于官方 [Xray-core](https://github.com/XTLS/Xray-core),自动生成 UUID/x25519/shortId,可选 VLESS Encryption 与 ML-DSA-65 后量子加固 |
-| `anytls-reality.sh` | AnyTLS + Reality (sing-box) | 基于 sing-box 1.12.12+,独立服务与配置目录,仅供 sing-box 客户端使用,自动生成 Reality 密钥并输出客户端 JSON |
+| `anytls-reality.sh` | AnyTLS + Reality (sing-box) | 最低要求 sing-box 1.12.12,安装/更新时自动跟随稳定版,仅供 sing-box 客户端使用,自动生成 Reality 密钥并输出客户端 JSON |
 | `shadow-tls.sh` | Shadow-TLS v3 前置 | 为已安装的 SS 2022 或 Snell 加壳,自动识别 Snell v5/v6 并收敛后端监听,输出 Surge/mihomo 配置 |
 | `tcp-tune.sh` | TCP 调优 | 启用 BBR + fq,按带宽时延积(BDP)放大 socket 缓冲区,含内存保护,可回退 |
 
@@ -61,6 +61,6 @@ bash <(wget -qO- https://raw.githubusercontent.com/ridaiqianhe/vps-proxy/refs/he
 
 ### AnyTLS 模式说明
 
-`anytls.sh` 和 `anytls-reality.sh` 都直接使用官方 sing-box，不再安装旧版独立 AnyTLS 服务端。普通 AnyTLS 使用自签名 TLS 证书，脚本会输出 Surge、mihomo、sing-box 和标准 `anytls://` 导入配置；使用自签名证书时客户端需要开启 `skip-cert-verify`/`insecure`，Surge 也可以使用脚本输出的证书 SHA-256 指纹进行固定。
+`anytls.sh` 和 `anytls-reality.sh` 都直接使用官方 sing-box，不再安装旧版独立 AnyTLS 服务端。每次执行安装/更新都会检查官方最新稳定版并升级旧版本，不会自动安装 beta。普通 AnyTLS 使用自签名 TLS 证书，脚本会输出 Surge、mihomo、sing-box 和标准 `anytls://` 导入配置；使用自签名证书时客户端需要开启 `skip-cert-verify`/`insecure`，Surge 也可以使用脚本输出的证书 SHA-256 指纹进行固定。
 
 `AnyTLS + Reality` 要求 sing-box 1.12.12+，服务端和客户端都必须使用 sing-box，并且客户端配置必须保留 `tls.utls`。Surge 和 mihomo 的普通 AnyTLS 配置不能直接套用 Reality 参数。

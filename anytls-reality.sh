@@ -2,7 +2,7 @@
 
 # ===================================================================
 # AnyTLS + Reality 一键安装/管理脚本
-# 运行核心: sing-box (脚本要求 1.12.12+，Reality 由 sing-box 提供)
+# 运行核心: sing-box (最低 1.12.12，安装/更新时跟随官方稳定版)
 # 注意: 本模式仅适用于 sing-box 客户端，不兼容 Surge/Mihomo 的普通 AnyTLS 模式。
 # 仓库: https://github.com/ridaiqianhe/vps-proxy
 # ===================================================================
@@ -19,6 +19,8 @@ GRAY='\e[90m'
 NC='\e[0m'
 
 SINGBOX_MIN_VERSION="1.12.12"
+SINGBOX_RELEASE_API="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+SINGBOX_INSTALLER_URL="https://sing-box.app/install.sh"
 SINGBOX_BIN=""
 SINGBOX_VERSION=""
 PKG_MANAGER=""
@@ -121,10 +123,12 @@ strip_version_suffix() {
 }
 
 version_at_least() {
-    local have need i h n
+    local have need have_raw need_raw have_suffix need_suffix i h n
     local -a have_parts need_parts
-    have="$(strip_version_suffix "$1")"
-    need="$(strip_version_suffix "$2")"
+    have_raw="${1#v}"
+    need_raw="${2#v}"
+    have="$(strip_version_suffix "$have_raw")"
+    need="$(strip_version_suffix "$need_raw")"
     IFS=. read -r -a have_parts <<< "$have"
     IFS=. read -r -a need_parts <<< "$need"
 
@@ -136,7 +140,9 @@ version_at_least() {
         if [ "$h" -gt "$n" ]; then return 0; fi
         if [ "$h" -lt "$n" ]; then return 1; fi
     done
-    return 0
+    have_suffix="${have_raw#"$have"}"
+    need_suffix="${need_raw#"$need"}"
+    [ -z "$have_suffix" ] || [ -n "$need_suffix" ]
 }
 
 read_binary_version() {
@@ -150,7 +156,7 @@ read_binary_version() {
 }
 
 select_singbox_binary() {
-    local candidate version
+    local candidate version best_bin="" best_version=""
     local -a candidates
     candidates=("$(type -P sing-box 2>/dev/null || true)" "/usr/bin/sing-box" "/usr/local/bin/sing-box")
 
@@ -158,40 +164,111 @@ select_singbox_binary() {
         [ -x "$candidate" ] || continue
         version="$(read_binary_version "$candidate")"
         [ -n "$version" ] || continue
-        if version_at_least "$version" "$SINGBOX_MIN_VERSION"; then
-            SINGBOX_BIN="$candidate"
-            SINGBOX_VERSION="$version"
-            return 0
+        if [ -z "$best_version" ] || ! version_at_least "$best_version" "$version"; then
+            best_bin="$candidate"
+            best_version="$version"
         fi
     done
-    return 1
+    SINGBOX_BIN="$best_bin"
+    SINGBOX_VERSION="$best_version"
+    [ -n "$SINGBOX_BIN" ]
+}
+
+get_latest_singbox_version() {
+    local response version
+    local -a curl_args
+    curl_args=(-fsSL --retry 2 --connect-timeout 15 --max-time 30)
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        curl_args+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+    fi
+    response="$(curl "${curl_args[@]}" "$SINGBOX_RELEASE_API" 2>/dev/null)" || return 1
+    version="$(printf '%s' "$response" | jq -er \
+        'select(.draft == false and .prerelease == false) | .tag_name' 2>/dev/null)" || return 1
+    version="${version#v}"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    version_at_least "$version" "$SINGBOX_MIN_VERSION" || return 1
+    printf '%s\n' "$version"
+}
+
+run_singbox_installer() {
+    local target_version="$1"
+    local installer="$TEMP_DIR/sing-box-install.sh"
+    if ! curl -fsSL --retry 2 --connect-timeout 15 --max-time 120 \
+        "$SINGBOX_INSTALLER_URL" -o "$installer"; then
+        log_error "下载 sing-box 官方安装器失败"
+        return 1
+    fi
+    if [ ! -s "$installer" ] || ! grep -q "SagerNet/sing-box" "$installer"; then
+        log_error "下载的 sing-box 安装器校验失败"
+        return 1
+    fi
+    if [ -n "$target_version" ]; then
+        (cd "$TEMP_DIR" && sh "$installer" --version "$target_version")
+    else
+        (cd "$TEMP_DIR" && sh "$installer")
+    fi
 }
 
 ensure_singbox() {
+    local installed=0 latest_version="" needs_install=0 previous_version=""
+    SINGBOX_BIN=""
+    SINGBOX_VERSION=""
     if select_singbox_binary; then
-        log_info "检测到 sing-box v$SINGBOX_VERSION"
+        installed=1
+        previous_version="$SINGBOX_VERSION"
+        log_info "检测到 sing-box v$SINGBOX_VERSION ($SINGBOX_BIN)"
+    fi
+
+    if latest_version="$(get_latest_singbox_version)"; then
+        log_info "官方最新稳定版: sing-box v$latest_version"
     else
-        log_info "安装/更新 sing-box（AnyTLS + Reality 需要 v$SINGBOX_MIN_VERSION 及以上）"
-        local installer="$TEMP_DIR/sing-box-install.sh"
-        if ! curl -fsSL --connect-timeout 15 --max-time 120 \
-            "https://sing-box.app/install.sh" -o "$installer"; then
-            log_error "下载 sing-box 官方安装器失败"
-            return 1
+        log_warn "无法获取 sing-box 最新稳定版，不能完成在线更新检查"
+    fi
+
+    if [ "$installed" = 0 ]; then
+        needs_install=1
+        log_info "未检测到 sing-box，准备安装官方稳定版"
+    elif ! version_at_least "$SINGBOX_VERSION" "$SINGBOX_MIN_VERSION"; then
+        needs_install=1
+        log_warn "当前 sing-box v$SINGBOX_VERSION 低于最低兼容版本 v$SINGBOX_MIN_VERSION"
+    elif [ -n "$latest_version" ] && ! version_at_least "$SINGBOX_VERSION" "$latest_version"; then
+        needs_install=1
+        log_info "准备升级 sing-box: v$SINGBOX_VERSION -> v$latest_version"
+    elif [ -n "$latest_version" ]; then
+        if [ "$SINGBOX_VERSION" = "$latest_version" ]; then
+            log_info "sing-box 已是最新稳定版"
+        else
+            log_info "当前 sing-box v$SINGBOX_VERSION 不低于稳定版 v${latest_version}，保留现有版本"
         fi
-        if [ ! -s "$installer" ] || ! grep -q "SagerNet/sing-box" "$installer"; then
-            log_error "下载的 sing-box 安装器校验失败"
-            return 1
-        fi
-        if ! (cd "$TEMP_DIR" && sh "$installer"); then
+    elif version_at_least "$SINGBOX_VERSION" "$SINGBOX_MIN_VERSION"; then
+        log_warn "继续使用兼容版本 v${SINGBOX_VERSION}；本次未确认是否存在更新"
+    fi
+
+    if [ "$needs_install" = 1 ]; then
+        if ! run_singbox_installer "$latest_version"; then
             log_error "sing-box 安装失败"
             return 1
         fi
         hash -r 2>/dev/null || true
+        SINGBOX_BIN=""
+        SINGBOX_VERSION=""
         if ! select_singbox_binary; then
-            log_error "安装后仍未找到 sing-box v$SINGBOX_MIN_VERSION 及以上"
+            log_error "安装后仍未找到 sing-box"
             return 1
         fi
-        log_info "sing-box v$SINGBOX_VERSION 安装完成"
+        if ! version_at_least "$SINGBOX_VERSION" "$SINGBOX_MIN_VERSION"; then
+            log_error "安装后的 sing-box v$SINGBOX_VERSION 仍低于最低版本 v$SINGBOX_MIN_VERSION"
+            return 1
+        fi
+        if [ -n "$latest_version" ] && ! version_at_least "$SINGBOX_VERSION" "$latest_version"; then
+            log_error "升级后检测到 v${SINGBOX_VERSION}，未达到目标稳定版 v$latest_version"
+            return 1
+        fi
+        if [ -n "$previous_version" ]; then
+            log_info "sing-box 已从 v$previous_version 升级到 v$SINGBOX_VERSION"
+        else
+            log_info "sing-box v$SINGBOX_VERSION 安装完成"
+        fi
     fi
 
     if ! "$SINGBOX_BIN" generate reality-keypair >/dev/null 2>&1; then
@@ -639,7 +716,7 @@ install_anytls_reality() {
     fi
 
     rm -f "$LEGACY_META_FILE"
-    log_info "AnyTLS + Reality 安装成功（sing-box v$SINGBOX_VERSION）"
+    log_info "AnyTLS + Reality 安装成功（sing-box v${SINGBOX_VERSION}）"
     show_config
 }
 
@@ -765,7 +842,7 @@ main() {
             3) show_config ;;
             4) show_logs ;;
             0) echo -e "  ${PURPLE}バイバイ~ (｡･ω･)ﾉﾞ${NC}"; exit 0 ;;
-            *) echo -e "  ${YELLOW}(・_・?) 没有「$choice」这个选项~${NC}"; sleep 1; continue ;;
+            *) echo -e "  ${YELLOW}(・_・?) 没有「${choice}」这个选项~${NC}"; sleep 1; continue ;;
         esac
         echo ""
         read -r -p "$(echo -e "  ${GRAY}按回车返回菜单...${NC}")" _
