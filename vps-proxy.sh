@@ -44,7 +44,7 @@ banner() {
     echo ""
     echo -e "${PURPLE}  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "     ${CYAN}✨ VPS-Proxy 一键脚本合集 ✨${NC}   ${YELLOW}(｡･ω･｡)ﾉ${NC}"
-    echo -e "     ${GRAY}Snell · Hysteria2 · SS2022 · AnyTLS · sing-box${NC}"
+    echo -e "     ${GRAY}Snell · Hysteria2 · SS2022 · AnyTLS · SOCKS/HTTP${NC}"
     echo -e "${PURPLE}  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
 }
@@ -61,9 +61,10 @@ while true; do
     echo -e "  ${GREEN}8.${NC} 🛡️  Shadow-TLS v3 ${GRAY}(为已装 SS/Snell 加壳)${NC}"
     echo -e "  ${GREEN}9.${NC} ⚙️  TCP 调优 ${GRAY}(BBR + BDP 缓冲)${NC}"
     echo -e "  ${GREEN}10.${NC} 🧩 AnyTLS + Reality ${GRAY}(sing-box 专属)${NC}"
+    echo -e "  ${GREEN}11.${NC} 🌐 SOCKS5 / HTTP ${GRAY}(Mixed 内网 · HTTPS 公网)${NC}"
     echo -e "  ${YELLOW}0.${NC} 👋 退出"
     echo ""
-    read -p "$(echo -e "  ${CYAN}请输入选项 [0-10]: ${NC}")" choice
+    read -p "$(echo -e "  ${CYAN}请输入选项 [0-11]: ${NC}")" choice
 
     case $choice in
         1) run_script "snell.sh" ;;
@@ -76,6 +77,7 @@ while true; do
         8) run_script "shadow-tls.sh" ;;
         9) run_script "tcp-tune.sh" ;;
         10) run_script "anytls-reality.sh" ;;
+        11) run_script "socks-http.sh" ;;
         0) echo -e "  ${PURPLE}バイバイ~ (｡･ω･)ﾉﾞ${NC}"; exit 0 ;;
         *)
             echo -e "  ${YELLOW}(・_・?) 没有「$choice」这个选项，再选一次吧~${NC}"
